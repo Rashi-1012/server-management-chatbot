@@ -39,6 +39,11 @@ st.markdown("""
     .status-up { color: #28a745; }
     .status-down { color: #dc3545; }
     .status-maintenance { color: #ffc107; }
+
+    /* Preserve line breaks in Markdown paragraphs */
+    [data-testid="stMarkdownContainer"] p {
+        white-space: pre-line;
+    }
 </style>
 """, unsafe_allow_html=True)
 
@@ -265,9 +270,11 @@ def show_chat_assistant():
     with chat_container:
         for message in st.session_state.chat_history:
             if message['role'] == 'user':
-                st.markdown(f"**You:** {message['content']}")
+                st.markdown("**You:**")
+                st.markdown(message['content'])
             else:
-                st.markdown(f"**Assistant:** {message['content']}")
+                st.markdown("**Assistant:**")
+                st.markdown(message['content'])
             st.markdown("---")
     
     # Chat input

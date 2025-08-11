@@ -52,13 +52,26 @@ A comprehensive server management dashboard and AI chatbot built with FastAPI, S
 
 2. **Install dependencies:**
    ```bash
+   # If you encounter SSL certificate issues, use this command:
+   python -m pip install -r requirements.txt --trusted-host pypi.org --trusted-host pypi.python.org --trusted-host files.pythonhosted.org
+   
+   # Or the standard command if SSL works:
    pip install -r requirements.txt
    ```
 
 3. **Set up environment variables (optional):**
-   Create a `.env` file for OpenAI integration:
+   A `.env` file has been created for you. Edit it to add your API keys:
    ```bash
-   OPENAI_API_KEY=your_openai_api_key_here
+   # Edit the .env file and replace the placeholder values:
+   
+   # For OpenAI GPT models (recommended):
+   OPENAI_API_KEY=sk-your-actual-openai-api-key-here
+   
+   # Alternative: For Google Gemini models:
+   GEMINI_API_KEY=your-actual-gemini-api-key-here
+   
+   # Get OpenAI API key from: https://platform.openai.com/api-keys
+   # Get Gemini API key from: https://aistudio.google.com/app/apikey
    ```
 
 ## 🚀 Usage
@@ -162,15 +175,24 @@ Without the API key, the chatbot will use rule-based responses.
 
 ### Common Issues
 
-1. **Port already in use**: 
+1. **SSL Certificate Errors during pip install**:
+   ```bash
+   # Use trusted hosts to bypass SSL verification
+   python -m pip install -r requirements.txt --trusted-host pypi.org --trusted-host pypi.python.org --trusted-host files.pythonhosted.org
+   
+   # For individual packages:
+   python -m pip install package_name --trusted-host pypi.org --trusted-host pypi.python.org --trusted-host files.pythonhosted.org
+   ```
+
+2. **Port already in use**: 
    - Change ports in `main.py` and `app.py`
    - Kill existing processes using the ports
 
-2. **Database connection errors**:
+3. **Database connection errors**:
    - Ensure write permissions in the project directory
    - Check if `server_inventory.db` exists
 
-3. **Package import errors**:
+4. **Package import errors**:
    - Verify all dependencies are installed: `pip install -r requirements.txt`
    - Check Python version compatibility
 
@@ -242,13 +264,18 @@ pip install -r requirements.txt
 
 ### 2. Setup Environment
 
-Edit .env file:
-`
+Edit the `.env` file and add your API keys:
+```
 DATABASE_URL=sqlite:///./server_inventory.db
-OPENAI_API_KEY=your_openai_api_key_here  # Optional
+
+# For enhanced AI responses, add one of these:
+OPENAI_API_KEY=sk-your-actual-openai-api-key-here
+# OR
+GEMINI_API_KEY=your-actual-gemini-api-key-here
+
 SECRET_KEY=your_secret_key_here
 DEBUG=True
-`
+```
 
 ### 3. Initialize Database
 

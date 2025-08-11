@@ -4,10 +4,8 @@ import logging
 import os
 import re
 import time
-from dataclasses import dataclass, field
-from enum import Enum
-from functools import lru_cache
-from typing import Any, Dict, List, Optional, Union
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional
 from urllib.parse import urljoin
 
 import google.generativeai as genai
@@ -16,17 +14,6 @@ from dotenv import load_dotenv
 
 # Load environment variables
 load_dotenv()
-
-
-class QueryType(Enum):
-    """Enumeration of supported query types."""
-    SUMMARY = "summary"
-    STATUS_QUERY = "status_query"
-    ENVIRONMENT_QUERY = "environment_query"
-    SPECIFIC_SERVER = "specific_server"
-    SEARCH = "search"
-    CONVERSATIONAL = "conversational"
-    ALL_SERVERS = "all_servers"
 
 
 class ServerChatbotError(Exception):
@@ -80,13 +67,7 @@ class PerformanceStats:
         return (self.cache_hits / max(total_requests, 1)) * 100
 
 
-@dataclass
-class QueryAnalysis:
-    """Result of query analysis."""
-    query_type: QueryType
-    data: Union[Dict, List, None]
-    confidence: float = 1.0
-    needs_gemini: bool = False
+    
 
 
 class LoggerManager:
@@ -197,12 +178,15 @@ Guidelines:
             # Configure Gemini
             genai.configure(api_key=api_key)
             
+            # Get model name from environment or use default
+            model_name = os.getenv('GEMINI_MODEL', 'gemini-1.5-flash')
+            
             # Initialize the model
-            self._gemini_model = genai.GenerativeModel('gemini-pro')
+            self._gemini_model = genai.GenerativeModel(model_name)
             
             # Test the connection
             self._test_gemini_connection()
-            logger.info("Gemini client initialized successfully.")
+            logger.info(f"Gemini client initialized successfully with model: {model_name}")
         except Exception as e:
             logger.error(f"Failed to initialize Gemini client: {e}")
             raise GeminiError(f"Gemini initialization failed: {e}")
@@ -448,21 +432,14 @@ Guidelines:
     def analyze_query(self, user_query: str) -> Dict[str, Any]:
         """Analyze user query to determine what data to fetch"""
         query_lower = user_query.lower()
-        
-        # Keywords for different types of queries
-        status_keywords = ['up', 'down', 'running', 'offline', 'maintenance', 'status']
-        environment_keywords = ['production', 'prod', 'staging', 'development', 'dev', 'test']
-        summary_keywords = ['how many', 'total', 'count', 'summary', 'overview']
+
+        # Keywords for different types of queries (reuse class-level sets for consistency)
+        status_keywords = list(self.STATUS_KEYWORDS)
+        environment_keywords = list(self.ENVIRONMENT_KEYWORDS)
+        summary_keywords = list(self.SUMMARY_KEYWORDS)
         search_keywords = ['find', 'search', 'show me', 'list']
-        
-        # Conversational/explanatory keywords that should use OpenAI
-        conversational_keywords = [
-            'explain', 'tell me about', 'describe', 'what do you think', 'analyze',
-            'recommend', 'suggest', 'advice', 'opinion', 'insight', 'interpretation',
-            'simple terms', 'in summary', 'overall', 'situation', 'health',
-            'assessment', 'evaluation', 'report', 'brief', 'rundown', 'breakdown'
-        ]
-        
+        conversational_keywords = list(self.CONVERSATIONAL_KEYWORDS)
+
         result = {
             'type': 'general',
             'data': {},
@@ -472,7 +449,7 @@ Guidelines:
         # Check for conversational/explanatory queries first
         if any(keyword in query_lower for keyword in conversational_keywords):
             result['type'] = 'conversational'
-            # Get summary data to provide context to OpenAI
+            # Get summary data to provide context to the LLM
             result['data'] = self.get_server_summary()
             return result
         
@@ -553,39 +530,34 @@ Guidelines:
         
         return info
     
-    def test_openai_connection(self) -> Dict[str, str]:
-        """Test if OpenAI API connection is working."""
-        if not self.openai_client:
-            return {
-                "status": "error", 
-                "message": "OpenAI client not initialized. Check your API key."
-            }
+    def format_server_name_only(self, server: Dict) -> str:
+        """Format server name only for simple lists"""
+        if 'error' in server:
+            return f"Error: {server['error']}"
+        return f"{server['name']}"
+    
+    def _wants_names_only(self, user_query: str) -> bool:
+        """Check if user wants only server names in response"""
+        query_lower = user_query.lower()
+        keywords = [
+            'only', 'just', 'names only', 'only names', 'just names',
+            'list names', 'server names', 'name only', 'only the names',
+            'just the names', 'names of', 'which servers', 'what servers'
+        ]
         
-        try:
-            response = self.openai_client.chat.completions.create(
-                model="gpt-3.5-turbo",
-                messages=[{"role": "user", "content": "Hello, just testing!"}],
-                max_tokens=10
-            )
-            return {
-                "status": "success", 
-                "message": "OpenAI API is working correctly!"
-            }
-        except openai.AuthenticationError:
-            return {
-                "status": "error", 
-                "message": "Invalid API key. Please check your OpenAI API key."
-            }
-        except openai.RateLimitError:
-            return {
-                "status": "error", 
-                "message": "Rate limit exceeded. Please try again later."
-            }
-        except Exception as e:
-            return {
-                "status": "error", 
-                "message": f"API Error: {str(e)}"
-            }
+        # Check if query contains "only" or "just" with "names"
+        if ('only' in query_lower and 'name' in query_lower) or \
+           ('just' in query_lower and 'name' in query_lower) or \
+           any(keyword in query_lower for keyword in keywords):
+            return True
+        
+        # Check for patterns like "which servers are down" (implies names only)
+        if query_lower.startswith(('which ', 'what ')) and 'server' in query_lower:
+            return True
+            
+        return False
+    
+    # Removed deprecated OpenAI test method
     
     def generate_response(self, user_query: str) -> str:
         """Generate a response to user query with comprehensive logging."""
@@ -630,13 +602,20 @@ Guidelines:
                 if not servers:
                     return "No servers found matching that status."
                 
-                logger.info(f"Generating status query response for {len(servers)} servers")
-                response = f"Found {len(servers)} servers:\n\n"
-                for server in servers[:10]:  # Limit to first 10
-                    response += self.format_server_info(server) + "\n"
+                # Check if user wants only names
+                names_only = self._wants_names_only(user_query)
+                logger.info(f"Generating status query response for {len(servers)} servers (names_only={names_only})")
                 
-                if len(servers) > 10:
-                    response += f"\n... and {len(servers) - 10} more servers."
+                if names_only:
+                    # Minimal output: just names, one per line
+                    response = "\n".join(self.format_server_name_only(s) for s in servers)
+                else:
+                    response = f"Found {len(servers)} servers:\n\n"
+                    for server in servers[:10]:  # Limit to first 10 for detailed view
+                        response += self.format_server_info(server) + "\n"
+                    
+                    if len(servers) > 10:
+                        response += f"\n... and {len(servers) - 10} more servers."
                 
                 duration = time.time() - start_time
                 logger.info(f"Generated status response in {duration:.2f}s")
@@ -662,13 +641,20 @@ Guidelines:
                 if not servers:
                     return "No servers found matching your query."
                 
-                logger.info(f"Generating search response for {len(servers)} servers")
-                response = f"Found {len(servers)} servers:\n\n"
-                for server in servers[:5]:  # Limit to first 5 for readability
-                    response += self.format_server_info(server) + "\n"
+                # Check if user wants only names
+                names_only = self._wants_names_only(user_query)
+                logger.info(f"Generating search response for {len(servers)} servers (names_only={names_only})")
                 
-                if len(servers) > 5:
-                    response += f"\n... and {len(servers) - 5} more servers."
+                if names_only:
+                    # Minimal output: just names, one per line
+                    response = "\n".join(self.format_server_name_only(s) for s in servers)
+                else:
+                    response = f"Found {len(servers)} servers:\n\n"
+                    for server in servers[:5]:  # Limit to first 5 for readability
+                        response += self.format_server_info(server) + "\n"
+                    
+                    if len(servers) > 5:
+                        response += f"\n... and {len(servers) - 5} more servers."
                 
                 duration = time.time() - start_time
                 logger.info(f"Generated search response in {duration:.2f}s")
@@ -773,74 +759,23 @@ Please provide a helpful response based on the available server data. Keep it co
                     
         return context.strip(', ')
     
-    def _manage_cache_size(self):
-        """Manage cache size to prevent memory issues."""
-        if len(self.cache) > self.max_cache_size:
-            # Remove oldest entries (simple FIFO)
-            oldest_keys = list(self.cache.keys())[:len(self.cache) - self.max_cache_size + 10]
-            for key in oldest_keys:
-                del self.cache[key]
-            logger.debug(f"Cache cleaned, removed {len(oldest_keys)} entries")
-    
-    def _get_from_gemini_cache(self, cache_key: str) -> Optional[str]:
-        """Get cached response with TTL check."""
-        if cache_key not in self._gemini_cache:
-            return None
-        
-        cached_response, timestamp = self._gemini_cache[cache_key]
-        age = time.time() - timestamp
-        
-        if age > self.cache_config.ttl:
-            del self._gemini_cache[cache_key]
-            if cache_key in self._cache_timestamps:
-                del self._cache_timestamps[cache_key]
-            logger.debug(f"Cache entry expired: {cache_key} (age: {age:.1f}s)")
-            return None
-        
-        return cached_response
-    
-    def _set_gemini_cache(self, cache_key: str, response: str) -> None:
-        """Set cache with automatic cleanup."""
-        self._gemini_cache[cache_key] = (response, time.time())
-        self._cache_timestamps[cache_key] = time.time()
-        self._manage_gemini_cache_size()
-    
-    def _manage_gemini_cache_size(self) -> None:
-        """Manage cache size and cleanup old entries with detailed logging."""
-        if len(self._gemini_cache) <= self.cache_config.max_size:
-            return
-        
-        logger.debug(f"Gemini cache cleanup: {len(self._gemini_cache)} entries, max: {self.cache_config.max_size}")
-        
-        # Remove oldest entries first
-        sorted_entries = sorted(
-            self._gemini_cache.items(), 
-            key=lambda x: x[1][1]  # Sort by timestamp
-        )
-        
-        entries_to_remove = len(self._gemini_cache) - self.cache_config.max_size + 10  # Remove extra for efficiency
-        for key, _ in sorted_entries[:entries_to_remove]:
-            del self._gemini_cache[key]
-            if key in self._cache_timestamps:
-                del self._cache_timestamps[key]
-        
-        logger.info(f"Gemini cache cleanup completed: removed {entries_to_remove} entries")
-    
-    def get_performance_stats(self) -> dict:
-        """Get performance statistics."""
-        stats = self.performance_stats.copy()
-        if stats['api_calls'] > 0:
-            stats['avg_api_time'] = stats['total_api_time'] / stats['api_calls']
-        if stats['openai_calls'] > 0:
-            stats['avg_openai_time'] = stats['total_openai_time'] / stats['openai_calls']
-        stats['cache_size'] = len(self.cache)
-        return stats
-    
-    def clear_cache(self):
-        """Clear response cache."""
-        cache_size = len(self.cache)
-        self.cache.clear()
-        logger.info(f"Cleared cache with {cache_size} entries")
+    # Consolidated performance and cache management (Gemini only)
+    def get_performance_stats(self) -> Dict[str, Any]:
+        """Get comprehensive performance statistics (API + Gemini)."""
+        return {
+            "api_calls": self.stats.api_calls,
+            "total_api_time": round(self.stats.total_api_time, 2),
+            "avg_api_time": round(self.stats.avg_api_time, 2),
+            "gemini_calls": self.stats.gemini_calls,
+            "total_gemini_time": round(self.stats.total_gemini_time, 2),
+            "avg_gemini_time": round(self.stats.avg_gemini_time, 2),
+            "gemini_errors": self.stats.gemini_errors,
+            "cache_hits": self.stats.cache_hits,
+            "cache_misses": self.stats.cache_misses,
+            "cache_hit_ratio": round(self.stats.cache_hit_ratio, 1),
+            "api_cache_size": len(self._api_cache),
+            "gemini_cache_size": len(self._gemini_cache),
+        }
     
     def _fallback_response(self, analysis: dict) -> str:
         """Generate fallback response when OpenAI is not available."""
@@ -871,27 +806,10 @@ Please provide a helpful response based on the available server data. Keep it co
         return "I have the server data but need more context to provide a helpful answer. Could you be more specific about what you'd like to know?"
     
     # Utility and management methods
-    def get_performance_stats(self) -> Dict[str, Any]:
-        """Get comprehensive performance statistics."""
-        return {
-            "api_calls": self.stats.api_calls,
-            "total_api_time": round(self.stats.total_api_time, 2),
-            "avg_api_time": round(self.stats.avg_api_time, 2),
-            "openai_calls": self.stats.openai_calls,
-            "total_openai_time": round(self.stats.total_openai_time, 2),
-            "avg_openai_time": round(self.stats.avg_openai_time, 2),
-            "openai_errors": self.stats.openai_errors,
-            "cache_hits": self.stats.cache_hits,
-            "cache_misses": self.stats.cache_misses,
-            "cache_hit_ratio": round(self.stats.cache_hit_ratio, 1),
-            "api_cache_size": len(self._api_cache),
-            "openai_cache_size": len(self._openai_cache)
-        }
-    
     def get_cache_stats(self) -> Dict[str, Any]:
         """Get detailed cache statistics."""
         api_valid = sum(1 for key in self._api_cache.keys() if self._is_cache_valid(key))
-        openai_valid = sum(1 for key in self._openai_cache.keys() if self._is_cache_valid(key))
+        gemini_valid = sum(1 for key in self._gemini_cache.keys() if self._is_cache_valid(key))
         
         return {
             "api_cache": {
@@ -900,11 +818,11 @@ Please provide a helpful response based on the available server data. Keep it co
                 "expired_entries": len(self._api_cache) - api_valid,
                 "max_size": self.cache_config.max_api_cache_size
             },
-            "openai_cache": {
-                "total_entries": len(self._openai_cache),
-                "valid_entries": openai_valid,
-                "expired_entries": len(self._openai_cache) - openai_valid,
-                "max_size": self.cache_config.max_openai_cache_size
+            "gemini_cache": {
+                "total_entries": len(self._gemini_cache),
+                "valid_entries": gemini_valid,
+                "expired_entries": len(self._gemini_cache) - gemini_valid,
+                "max_size": self.cache_config.max_gemini_cache_size
             },
             "ttl_seconds": self.cache_config.ttl_seconds
         }
@@ -914,17 +832,17 @@ Please provide a helpful response based on the available server data. Keep it co
         Clear cached data.
         
         Args:
-            cache_type: Type of cache to clear ("api", "openai", or "all")
+            cache_type: Type of cache to clear ("api", "gemini", or "all")
         """
         if cache_type in ("api", "all"):
             api_size = len(self._api_cache)
             self._api_cache.clear()
             logger.info(f"API cache cleared: {api_size} entries removed")
         
-        if cache_type in ("openai", "all"):
-            openai_size = len(self._openai_cache)
-            self._openai_cache.clear()
-            logger.info(f"OpenAI cache cleared: {openai_size} entries removed")
+        if cache_type in ("gemini", "all"):
+            gemini_size = len(self._gemini_cache)
+            self._gemini_cache.clear()
+            logger.info(f"Gemini cache cleared: {gemini_size} entries removed")
         
         if cache_type == "all":
             self._cache_timestamps.clear()
@@ -933,7 +851,7 @@ Please provide a helpful response based on the available server data. Keep it co
         """Perform a comprehensive health check."""
         health_status = {
             "api_connectivity": False,
-            "openai_availability": self.is_openai_available,
+            "gemini_availability": self.is_gemini_available,
             "cache_status": "healthy",
             "performance": self.get_performance_stats(),
             "timestamp": time.time()
@@ -948,10 +866,10 @@ Please provide a helpful response based on the available server data. Keep it co
             health_status["api_connectivity"] = False
         
         # Check cache health
-        total_cache_size = len(self._api_cache) + len(self._openai_cache)
+        total_cache_size = len(self._api_cache) + len(self._gemini_cache)
         max_total_size = (
             self.cache_config.max_api_cache_size + 
-            self.cache_config.max_openai_cache_size
+            self.cache_config.max_gemini_cache_size
         )
         
         if total_cache_size > max_total_size * 0.9:
@@ -963,7 +881,7 @@ Please provide a helpful response based on the available server data. Keep it co
         """String representation of the chatbot."""
         return (
             f"ServerChatbot(api_url='{self.api_base_url}', "
-            f"openai_available={self.is_openai_available}, "
+            f"gemini_available={self.is_gemini_available}, "
             f"api_calls={self.stats.api_calls})"
         )
     
