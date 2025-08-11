@@ -7,6 +7,8 @@ from datetime import datetime
 import json
 from chatbot import ServerChatbot
 from datetime import datetime
+import os
+from dotenv import load_dotenv
 
 # Page configuration
 st.set_page_config(
@@ -55,8 +57,11 @@ if 'chat_history' not in st.session_state:
 if 'chatbot' not in st.session_state:
     st.session_state.chatbot = ServerChatbot()
 
-# API base URL
-API_BASE_URL = "http://localhost:8000"
+# Load environment variables
+load_dotenv()
+
+# API base URL (can be overridden via .env)
+API_BASE_URL = os.getenv("API_BASE_URL", "http://localhost:8000")
 
 @st.cache_data(ttl=60)  # Cache for 1 minute
 def fetch_api_data(endpoint, params=None):
