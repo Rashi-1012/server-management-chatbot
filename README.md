@@ -266,7 +266,7 @@ API will be available at: http://localhost:8000
 ### 5. Start Web Application
 
 `ash
-streamlit run app.py
+python -m streamlit run app.py
 `
 Web app will be available at: http://localhost:8501
 

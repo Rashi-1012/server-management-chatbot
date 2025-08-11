@@ -1,67 +1,449 @@
-import openai
-import requests
+import hashlib
 import json
-import re
-from typing import Dict, List, Any
+import logging
 import os
+import re
+import time
+from dataclasses import dataclass, field
+from enum import Enum
+from functools import lru_cache
+from typing import Any, Dict, List, Optional, Union
+from urllib.parse import urljoin
+
+import google.generativeai as genai
+import requests
 from dotenv import load_dotenv
 
+# Load environment variables
 load_dotenv()
 
+
+class QueryType(Enum):
+    """Enumeration of supported query types."""
+    SUMMARY = "summary"
+    STATUS_QUERY = "status_query"
+    ENVIRONMENT_QUERY = "environment_query"
+    SPECIFIC_SERVER = "specific_server"
+    SEARCH = "search"
+    CONVERSATIONAL = "conversational"
+    ALL_SERVERS = "all_servers"
+
+
+class ServerChatbotError(Exception):
+    """Base exception for ServerChatbot errors."""
+    pass
+
+
+class APIError(ServerChatbotError):
+    """Exception raised for API-related errors."""
+    pass
+
+
+class GeminiError(ServerChatbotError):
+    """Exception raised for Gemini-related errors."""
+    pass
+
+
+@dataclass
+class CacheConfig:
+    """Configuration for caching behavior."""
+    ttl_seconds: int = 60
+    max_api_cache_size: int = 50
+    max_gemini_cache_size: int = 100
+
+
+@dataclass
+class PerformanceStats:
+    """Performance statistics tracking."""
+    api_calls: int = 0
+    total_api_time: float = 0.0
+    gemini_calls: int = 0
+    total_gemini_time: float = 0.0
+    gemini_errors: int = 0
+    cache_hits: int = 0
+    cache_misses: int = 0
+
+    @property
+    def avg_api_time(self) -> float:
+        """Average API response time."""
+        return self.total_api_time / max(self.api_calls, 1)
+
+    @property
+    def avg_gemini_time(self) -> float:
+        """Average Gemini response time."""
+        return self.total_gemini_time / max(self.gemini_calls, 1)
+
+    @property
+    def cache_hit_ratio(self) -> float:
+        """Cache hit ratio as percentage."""
+        total_requests = self.cache_hits + self.cache_misses
+        return (self.cache_hits / max(total_requests, 1)) * 100
+
+
+@dataclass
+class QueryAnalysis:
+    """Result of query analysis."""
+    query_type: QueryType
+    data: Union[Dict, List, None]
+    confidence: float = 1.0
+    needs_gemini: bool = False
+
+
+class LoggerManager:
+    """Centralized logging configuration."""
+    
+    @staticmethod
+    def setup_logger(name: str, level: int = logging.INFO) -> logging.Logger:
+        """Set up a logger with consistent formatting."""
+        logger = logging.getLogger(name)
+        
+        if not logger.handlers:  # Avoid duplicate handlers
+            handler = logging.StreamHandler()
+            formatter = logging.Formatter(
+                '%(asctime)s - %(name)s - %(levelname)s - %(message)s'
+            )
+            handler.setFormatter(formatter)
+            logger.addHandler(handler)
+            logger.setLevel(level)
+        
+        return logger
+
+
+# Initialize logger
+logger = LoggerManager.setup_logger(__name__)
+
 class ServerChatbot:
-    def __init__(self, api_base_url="http://localhost:8000"):
-        self.api_base_url = api_base_url
-        self.openai_api_key = os.getenv("OPENAI_API_KEY")
-        if self.openai_api_key and self.openai_api_key != "your_openai_api_key_here":
-            openai.api_key = self.openai_api_key
+
+    # Class constants
+    DEFAULT_API_BASE_URL = "http://localhost:8000"
+    DEFAULT_TIMEOUT = 10
+    MAX_RETRIES = 3
+    
+    # Query classification keywords
+    STATUS_KEYWORDS = frozenset([
+        'up', 'down', 'running', 'offline', 'maintenance', 'status'
+    ])
+    
+    ENVIRONMENT_KEYWORDS = frozenset([
+        'production', 'prod', 'staging', 'development', 'dev', 'test'
+    ])
+    
+    SUMMARY_KEYWORDS = frozenset([
+        'how many', 'total', 'count', 'summary', 'overview'
+    ])
+    
+    CONVERSATIONAL_KEYWORDS = frozenset([
+        'explain', 'tell me about', 'describe', 'what do you think', 'analyze',
+        'recommend', 'suggest', 'advice', 'opinion', 'insight', 'interpretation',
+        'simple terms', 'in summary', 'overall', 'situation', 'health',
+        'assessment', 'evaluation', 'report', 'brief', 'rundown', 'breakdown'
+    ])
+    
+    def __init__(
+        self,
+        api_base_url: str = None,
+        cache_config: CacheConfig = None,
+        timeout: int = None
+    ):
         
-        # System prompt for the chatbot
-        self.system_prompt = '''You are a helpful server management assistant for a Chennai data center. 
-        You have access to live server data through API calls and can answer questions about:
-        - Server status, specifications, and details
-        - Who owns/manages servers
-        - Server environments (production, staging, development)
-        - Server locations and configurations
+        self.api_base_url = api_base_url or self.DEFAULT_API_BASE_URL
+        self.timeout = timeout or self.DEFAULT_TIMEOUT
+        self.cache_config = cache_config or CacheConfig()
         
-        Always provide accurate, up-to-date information from the live API. If you cannot find specific information,
-        say so clearly. Be concise but helpful in your responses.
+        # Initialize caching
+        self._api_cache: Dict[str, Any] = {}
+        self._gemini_cache: Dict[str, Any] = {}
+        self._cache_timestamps: Dict[str, float] = {}
         
-        When users ask about servers, always check the live data rather than relying on general knowledge.
-        '''
+        # Performance tracking
+        self.stats = PerformanceStats()
+        
+        # Gemini client
+        self._gemini_model: Optional[genai.GenerativeModel] = None
+        
+        # System prompt for Gemini
+        self._system_prompt = self._build_system_prompt()
+        
+        logger.info(f"Initializing ServerChatbot with API: {self.api_base_url}")
+        self._initialize_gemini()
+        
+    def _build_system_prompt(self) -> str:
+        """Build the system prompt for Gemini interactions."""
+        return """You are a helpful server management assistant for a Chennai data center.
+        
+You have access to live server data and can answer questions about:
+- Server status, specifications, and details
+- Server ownership and management
+- Server environments (production, staging, development)
+- Server locations and configurations
+
+Guidelines:
+- Always provide accurate, up-to-date information from live data
+- Be concise but comprehensive in responses
+- Use proper formatting with line breaks and structure
+- If information is unavailable, state this clearly
+- Focus on actionable insights when possible
+"""
+    
+    def _initialize_gemini(self) -> None:
+        """Initialize Gemini client with proper error handling."""
+        api_key = os.getenv("GEMINI_API_KEY")
+        
+        if not api_key or api_key.startswith("your_"):
+            logger.warning("No valid Gemini API key found. Operating in basic mode.")
+            return
+            
+        try:
+            # Configure Gemini
+            genai.configure(api_key=api_key)
+            
+            # Initialize the model
+            self._gemini_model = genai.GenerativeModel('gemini-pro')
+            
+            # Test the connection
+            self._test_gemini_connection()
+            logger.info("Gemini client initialized successfully.")
+        except Exception as e:
+            logger.error(f"Failed to initialize Gemini client: {e}")
+            raise GeminiError(f"Gemini initialization failed: {e}")
+    
+    def _test_gemini_connection(self) -> None:
+        """Test Gemini connection with a minimal API call."""
+        if not self._gemini_model:
+            return
+            
+        try:
+            response = self._gemini_model.generate_content("Hello")
+            logger.debug(f"Gemini connection test successful: {response.text[:50]}...")
+        except Exception as e:
+            logger.warning(f"Gemini connection test failed: {e}")
+    
+    @property
+    def is_gemini_available(self) -> bool:
+        """Check if Gemini client is available."""
+        return self._gemini_model is not None
+    
+    def _is_cache_valid(self, cache_key: str) -> bool:
+        """Check if cached data is still valid based on TTL."""
+        if cache_key not in self._cache_timestamps:
+            return False
+        age = time.time() - self._cache_timestamps[cache_key]
+        return age < self.cache_config.ttl_seconds
+    
+    def _get_from_api_cache(self, cache_key: str) -> Optional[Any]:
+        """Retrieve data from API cache if valid."""
+        if self._is_cache_valid(cache_key) and cache_key in self._api_cache:
+            self.stats.cache_hits += 1
+            logger.debug(f"API cache hit: {cache_key}")
+            return self._api_cache[cache_key]
+        
+        self.stats.cache_misses += 1
+        return None
+    
+    def _set_api_cache(self, cache_key: str, data: Any) -> None:
+        """Store data in API cache with size management."""
+        self._api_cache[cache_key] = data
+        self._cache_timestamps[cache_key] = time.time()
+        
+        # Manage cache size
+        if len(self._api_cache) > self.cache_config.max_api_cache_size:
+            self._cleanup_api_cache()
+        
+        logger.debug(f"API cache set: {cache_key}")
+    
+    def _get_from_gemini_cache(self, cache_key: str) -> Optional[str]:
+        """Retrieve response from Gemini cache if valid."""
+        if self._is_cache_valid(cache_key) and cache_key in self._gemini_cache:
+            self.stats.cache_hits += 1
+            logger.debug(f"Gemini cache hit: {cache_key}")
+            return self._gemini_cache[cache_key]
+        
+        self.stats.cache_misses += 1
+        return None
+    
+    def _set_gemini_cache(self, cache_key: str, response: str) -> None:
+        """Store response in Gemini cache with size management."""
+        self._gemini_cache[cache_key] = response
+        self._cache_timestamps[cache_key] = time.time()
+        
+        # Manage cache size
+        if len(self._gemini_cache) > self.cache_config.max_gemini_cache_size:
+            self._cleanup_gemini_cache()
+        
+        logger.debug(f"Gemini cache set: {cache_key}")
+    
+    def _cleanup_api_cache(self) -> None:
+        """Remove oldest entries from API cache."""
+        sorted_keys = sorted(
+            self._api_cache.keys(),
+            key=lambda k: self._cache_timestamps.get(k, 0)
+        )
+        
+        keys_to_remove = sorted_keys[:len(sorted_keys) // 4]  # Remove 25% oldest
+        for key in keys_to_remove:
+            self._api_cache.pop(key, None)
+            self._cache_timestamps.pop(key, None)
+        
+        logger.debug(f"API cache cleaned: removed {len(keys_to_remove)} entries")
+    
+    def _cleanup_gemini_cache(self) -> None:
+        """Remove oldest entries from Gemini cache."""
+        sorted_keys = sorted(
+            self._gemini_cache.keys(),
+            key=lambda k: self._cache_timestamps.get(k, 0)
+        )
+        
+        keys_to_remove = sorted_keys[:len(sorted_keys) // 4]  # Remove 25% oldest
+        for key in keys_to_remove:
+            self._gemini_cache.pop(key, None)
+            self._cache_timestamps.pop(key, None)
+        
+        logger.debug(f"Gemini cache cleaned: removed {len(keys_to_remove)} entries")
     
     def call_api(self, endpoint: str, params: Dict = None) -> Dict:
-        """Call the server management API"""
+       
         try:
-            url = f"{self.api_base_url}{endpoint}"
-            response = requests.get(url, params=params or {}, timeout=10)
+            return self._make_api_request(endpoint, params)
+        except APIError as e:
+            return {"error": str(e)}
+    
+    def _make_api_request(self, endpoint: str, params: Optional[Dict] = None) -> Any:
+        
+        # Input validation
+        if not endpoint.startswith('/'):
+            endpoint = f'/{endpoint}'
+        
+        # Create cache key
+        cache_key = f"{endpoint}:{json.dumps(params or {}, sort_keys=True)}"
+        
+        # Check cache first
+        cached_data = self._get_from_api_cache(cache_key)
+        if cached_data is not None:
+            return cached_data
+        
+        # Prepare request
+        url = urljoin(self.api_base_url, endpoint)
+        start_time = time.time()
+        
+        logger.debug(f"Making API request: {url} with params: {params}")
+        
+        try:
+            response = requests.get(
+                url,
+                params=params or {},
+                timeout=self.timeout,
+                headers={'Accept': 'application/json'}
+            )
             response.raise_for_status()
-            return response.json()
-        except requests.exceptions.RequestException as e:
-            return {"error": f"API call failed: {str(e)}"}
+            
+            try:
+                data = response.json()
+            except json.JSONDecodeError as e:
+                raise APIError(f"Invalid JSON response from {endpoint}: {e}")
+            
+            # Update performance stats
+            duration = time.time() - start_time
+            self.stats.api_calls += 1
+            self.stats.total_api_time += duration
+            
+            logger.info(
+                f"API call to {endpoint} completed in {duration:.2f}s. "
+                f"Response size: {len(str(data))} chars"
+            )
+            
+            # Cache the response
+            self._set_api_cache(cache_key, data)
+            return data
+            
+        except requests.exceptions.Timeout:
+            duration = time.time() - start_time
+            error_msg = f"API timeout after {duration:.2f}s for {endpoint}"
+            logger.error(error_msg)
+            raise APIError(error_msg)
+            
+        except requests.exceptions.ConnectionError:
+            duration = time.time() - start_time
+            error_msg = f"Connection error after {duration:.2f}s for {endpoint}"
+            logger.error(error_msg)
+            raise APIError(error_msg)
+            
+        except requests.exceptions.HTTPError as e:
+            duration = time.time() - start_time
+            error_msg = f"HTTP error {e.response.status_code} after {duration:.2f}s for {endpoint}"
+            logger.error(error_msg)
+            raise APIError(error_msg)
+            
+        except Exception as e:
+            duration = time.time() - start_time
+            error_msg = f"Unexpected error after {duration:.2f}s for {endpoint}: {e}"
+            logger.error(error_msg)
+            raise APIError(error_msg)
     
-    def get_server_summary(self) -> Dict:
-        """Get server summary statistics"""
-        return self.call_api("/api/summary")
+    # API convenience methods with proper typing
+    def get_server_summary(self) -> Dict[str, Any]:
+        """Get comprehensive server summary statistics."""
+        try:
+            return self._make_api_request("/api/summary")
+        except APIError as e:
+            logger.error(f"Failed to get server summary: {e}")
+            return {"error": str(e)}
     
-    def search_servers(self, query: str) -> List[Dict]:
-        """Search for servers by name, IP, or notes"""
-        return self.call_api("/api/servers", {"search": query})
+    def search_servers(self, query: str) -> List[Dict[str, Any]]:
+        """Search for servers by name, IP, or notes."""
+        if not query.strip():
+            return []
+        
+        try:
+            result = self._make_api_request("/api/servers", {"search": query})
+            return result if isinstance(result, list) else []
+        except APIError as e:
+            logger.error(f"Failed to search servers: {e}")
+            return []
     
-    def get_servers_by_environment(self, environment: str) -> List[Dict]:
-        """Get servers by environment"""
-        return self.call_api("/api/servers", {"environment": environment})
+    def get_servers_by_environment(self, environment: str) -> List[Dict[str, Any]]:
+        """Get servers filtered by environment."""
+        if not environment.strip():
+            return []
+        
+        try:
+            result = self._make_api_request("/api/servers", {"environment": environment})
+            return result if isinstance(result, list) else []
+        except APIError as e:
+            logger.error(f"Failed to get servers by environment: {e}")
+            return []
     
-    def get_servers_by_status(self, status: str) -> List[Dict]:
-        """Get servers by status"""
-        return self.call_api("/api/servers", {"status": status})
+    def get_servers_by_status(self, status: str) -> List[Dict[str, Any]]:
+        """Get servers filtered by status."""
+        if not status.strip():
+            return []
+        
+        try:
+            result = self._make_api_request("/api/servers", {"status": status})
+            return result if isinstance(result, list) else []
+        except APIError as e:
+            logger.error(f"Failed to get servers by status: {e}")
+            return []
     
-    def get_server_by_name(self, name: str) -> Dict:
-        """Get specific server by name"""
-        return self.call_api(f"/api/servers/name/{name}")
+    def get_server_by_name(self, name: str) -> Optional[Dict[str, Any]]:
+        """Get specific server by name."""
+        if not name.strip():
+            return None
+        
+        try:
+            result = self._make_api_request(f"/api/servers/name/{name}")
+            return result if isinstance(result, dict) and "error" not in result else None
+        except APIError as e:
+            logger.error(f"Failed to get server by name: {e}")
+            return None
     
-    def get_all_servers(self) -> List[Dict]:
-        """Get all servers"""
-        return self.call_api("/api/servers")
+    def get_all_servers(self) -> List[Dict[str, Any]]:
+        """Get all servers with error handling."""
+        try:
+            result = self._make_api_request("/api/servers")
+            return result if isinstance(result, list) else []
+        except APIError as e:
+            logger.error(f"Failed to get all servers: {e}")
+            return []
     
     def analyze_query(self, user_query: str) -> Dict[str, Any]:
         """Analyze user query to determine what data to fetch"""
@@ -73,14 +455,29 @@ class ServerChatbot:
         summary_keywords = ['how many', 'total', 'count', 'summary', 'overview']
         search_keywords = ['find', 'search', 'show me', 'list']
         
+        # Conversational/explanatory keywords that should use OpenAI
+        conversational_keywords = [
+            'explain', 'tell me about', 'describe', 'what do you think', 'analyze',
+            'recommend', 'suggest', 'advice', 'opinion', 'insight', 'interpretation',
+            'simple terms', 'in summary', 'overall', 'situation', 'health',
+            'assessment', 'evaluation', 'report', 'brief', 'rundown', 'breakdown'
+        ]
+        
         result = {
             'type': 'general',
             'data': {},
             'needs_api': True
         }
         
+        # Check for conversational/explanatory queries first
+        if any(keyword in query_lower for keyword in conversational_keywords):
+            result['type'] = 'conversational'
+            # Get summary data to provide context to OpenAI
+            result['data'] = self.get_server_summary()
+            return result
+        
         # Check for summary requests
-        if any(keyword in query_lower for keyword in summary_keywords):
+        elif any(keyword in query_lower for keyword in summary_keywords):
             result['type'] = 'summary'
             result['data'] = self.get_server_summary()
         
@@ -131,10 +528,10 @@ class ServerChatbot:
                 result['type'] = 'search'
                 result['data'] = self.search_servers(user_query)
         
-        # Default to search
+        # Default to conversational with summary data for complex queries
         else:
-            result['type'] = 'search'
-            result['data'] = self.search_servers(user_query)
+            result['type'] = 'conversational'
+            result['data'] = self.get_server_summary()
         
         return result
     
@@ -156,96 +553,420 @@ class ServerChatbot:
         
         return info
     
+    def test_openai_connection(self) -> Dict[str, str]:
+        """Test if OpenAI API connection is working."""
+        if not self.openai_client:
+            return {
+                "status": "error", 
+                "message": "OpenAI client not initialized. Check your API key."
+            }
+        
+        try:
+            response = self.openai_client.chat.completions.create(
+                model="gpt-3.5-turbo",
+                messages=[{"role": "user", "content": "Hello, just testing!"}],
+                max_tokens=10
+            )
+            return {
+                "status": "success", 
+                "message": "OpenAI API is working correctly!"
+            }
+        except openai.AuthenticationError:
+            return {
+                "status": "error", 
+                "message": "Invalid API key. Please check your OpenAI API key."
+            }
+        except openai.RateLimitError:
+            return {
+                "status": "error", 
+                "message": "Rate limit exceeded. Please try again later."
+            }
+        except Exception as e:
+            return {
+                "status": "error", 
+                "message": f"API Error: {str(e)}"
+            }
+    
     def generate_response(self, user_query: str) -> str:
-        """Generate a response to user query"""
-        # Analyze the query and get relevant data
-        analysis = self.analyze_query(user_query)
+        """Generate a response to user query with comprehensive logging."""
+        start_time = time.time()
+        logger.info(f"Processing user query: '{user_query[:100]}{'...' if len(user_query) > 100 else ''}'")
         
-        # Handle different types of responses
-        if analysis['type'] == 'summary':
-            data = analysis['data']
-            if 'error' in data:
-                return f"Sorry, I couldn't get the server summary: {data['error']}"
+        try:
+            # Analyze the query and get relevant data
+            analysis = self.analyze_query(user_query)
+            logger.debug(f"Query analysis result: type='{analysis['type']}'")
             
-            response = f"**Server Summary for Chennai Data Center:**\n\n"
-            response += f" Total servers: {data['total_servers']}\n"
-            response += f" Active servers: {data['active_servers']}\n"
-            response += f" Servers up: {data['servers_up']}\n"
-            response += f" Servers down: {data['servers_down']}\n"
-            response += f" Servers in maintenance: {data['servers_maintenance']}\n\n"
-            
-            if data['environments']:
-                response += "**By Environment:**\n"
-                for env, count in data['environments'].items():
-                    response += f" {env.title()}: {count} servers\n"
-            
-            return response
-        
-        elif analysis['type'] == 'status_query':
-            servers = analysis['data']
-            if isinstance(servers, dict) and 'error' in servers:
-                return f"Sorry, I couldn't get the server status: {servers['error']}"
-            
-            if not servers:
-                return "No servers found matching that status."
-            
-            response = f"Found {len(servers)} servers:\n\n"
-            for server in servers[:10]:  # Limit to first 10
-                response += self.format_server_info(server) + "\n"
-            
-            if len(servers) > 10:
-                response += f"\n... and {len(servers) - 10} more servers."
-            
-            return response
-        
-        elif analysis['type'] == 'specific_server':
-            server = analysis['data']
-            if isinstance(server, dict) and 'error' in server:
-                return f"Sorry, I couldn't find that server: {server['error']}"
-            
-            return self.format_server_info(server)
-        
-        elif analysis['type'] in ['search', 'environment_query']:
-            servers = analysis['data']
-            if isinstance(servers, dict) and 'error' in servers:
-                return f"Sorry, I couldn't search for servers: {servers['error']}"
-            
-            if not servers:
-                return "No servers found matching your query."
-            
-            response = f"Found {len(servers)} servers:\n\n"
-            for server in servers[:5]:  # Limit to first 5 for readability
-                response += self.format_server_info(server) + "\n"
-            
-            if len(servers) > 5:
-                response += f"\n... and {len(servers) - 5} more servers."
-            
-            return response
-        
-        # If we have OpenAI API key, use it for more natural responses
-        if self.openai_api_key and self.openai_api_key != "your_openai_api_key_here":
-            try:
-                # Prepare context with the data
-                context = f"User query: {user_query}\n\nRelevant server data: {json.dumps(analysis['data'], indent=2)}"
+            # Handle different types of responses
+            if analysis['type'] == 'summary':
+                data = analysis['data']
+                if 'error' in data:
+                    logger.warning(f"Error getting server summary: {data['error']}")
+                    return f"Sorry, I couldn't get the server summary: {data['error']}"
                 
-                response = openai.ChatCompletion.create(
-                    model="gpt-3.5-turbo",
-                    messages=[
-                        {"role": "system", "content": self.system_prompt},
-                        {"role": "user", "content": context}
-                    ],
-                    max_tokens=500,
-                    temperature=0.7
-                )
+                logger.info("Generating server summary response")
+                response = f"**Server Summary for Chennai Data Center:**\n\n"
+                response += f" Total servers: {data['total_servers']}\n"
+                response += f" Active servers: {data['active_servers']}\n"
+                response += f" Servers up: {data['servers_up']}\n"
+                response += f" Servers down: {data['servers_down']}\n"
+                response += f" Servers in maintenance: {data['servers_maintenance']}\n\n"
                 
-                return response.choices[0].message.content
-            except Exception as e:
-                # Fallback to rule-based response
-                pass
+                if data['environments']:
+                    response += "**By Environment:**\n"
+                    for env, count in data['environments'].items():
+                        response += f" {env.title()}: {count} servers\n"
+                
+                duration = time.time() - start_time
+                logger.info(f"Generated summary response in {duration:.2f}s")
+                return response
+            
+            elif analysis['type'] == 'status_query':
+                servers = analysis['data']
+                if isinstance(servers, dict) and 'error' in servers:
+                    logger.warning(f"Error getting server status: {servers['error']}")
+                    return f"Sorry, I couldn't get the server status: {servers['error']}"
+                
+                if not servers:
+                    return "No servers found matching that status."
+                
+                logger.info(f"Generating status query response for {len(servers)} servers")
+                response = f"Found {len(servers)} servers:\n\n"
+                for server in servers[:10]:  # Limit to first 10
+                    response += self.format_server_info(server) + "\n"
+                
+                if len(servers) > 10:
+                    response += f"\n... and {len(servers) - 10} more servers."
+                
+                duration = time.time() - start_time
+                logger.info(f"Generated status response in {duration:.2f}s")
+                return response
+            
+            elif analysis['type'] == 'specific_server':
+                server = analysis['data']
+                if isinstance(server, dict) and 'error' in server:
+                    logger.warning(f"Error finding specific server: {server['error']}")
+                    return f"Sorry, I couldn't find that server: {server['error']}"
+                
+                logger.info("Generating specific server response")
+                duration = time.time() - start_time
+                logger.info(f"Generated specific server response in {duration:.2f}s")
+                return self.format_server_info(server)
+            
+            elif analysis['type'] in ['search', 'environment_query']:
+                servers = analysis['data']
+                if isinstance(servers, dict) and 'error' in servers:
+                    logger.warning(f"Error searching servers: {servers['error']}")
+                    return f"Sorry, I couldn't search for servers: {servers['error']}"
+                
+                if not servers:
+                    return "No servers found matching your query."
+                
+                logger.info(f"Generating search response for {len(servers)} servers")
+                response = f"Found {len(servers)} servers:\n\n"
+                for server in servers[:5]:  # Limit to first 5 for readability
+                    response += self.format_server_info(server) + "\n"
+                
+                if len(servers) > 5:
+                    response += f"\n... and {len(servers) - 5} more servers."
+                
+                duration = time.time() - start_time
+                logger.info(f"Generated search response in {duration:.2f}s")
+                return response
+            
+            elif analysis['type'] == 'conversational':
+                # For conversational queries, always use Gemini with context
+                logger.info("Processing conversational query with Gemini")
+                duration = time.time() - start_time
+                logger.info(f"Routing to Gemini after {duration:.2f}s")
+                return self._generate_gemini_response(user_query, analysis)
+            
+            # Try Gemini for more natural responses
+            duration = time.time() - start_time
+            logger.info(f"Fallback to Gemini after {duration:.2f}s")
+            return self._generate_gemini_response(user_query, analysis)
+            
+        except Exception as e:
+            duration = time.time() - start_time
+            logger.error(f"Error generating response after {duration:.2f}s: {e}")
+            return f"Sorry, I encountered an error while processing your request: {str(e)}"
+    
+    def _generate_gemini_response(self, user_query: str, analysis: dict) -> str:
+        """Generate response using Gemini with comprehensive error handling and caching."""
+        cache_key = hashlib.md5(user_query.encode()).hexdigest()
         
-        # Fallback response
-        return "I have the server data but need more context to provide a helpful answer. Could you be more specific about what you'd like to know?"
+        # Check cache first
+        cached_response = self._get_from_gemini_cache(cache_key)
+        if cached_response:
+            age = time.time() - self._cache_timestamps.get(cache_key, 0)
+            logger.info(f"Using cached Gemini response (age: {age:.1f}s)")
+            return cached_response
+        
+        start_time = time.time()
+        logger.info("Generating Gemini response")
+        
+        try:
+            # Build context from analysis
+            context = self._build_context_from_analysis(analysis)
+            
+            prompt = f"""{self._system_prompt}
 
+Context about the servers:
+{context}
+
+User query: {user_query}
+
+Please provide a helpful response based on the available server data. Keep it concise and informative."""
+
+            logger.debug(f"Gemini prompt length: {len(prompt)} characters")
+            
+            if not self._gemini_model:
+                logger.warning("Gemini model not available, using fallback response")
+                return self._fallback_response(analysis)
+            
+            response = self._gemini_model.generate_content(prompt)
+            
+            if not response.text:
+                logger.warning("Empty response from Gemini")
+                return self._fallback_response(analysis)
+            
+            ai_response = response.text.strip()
+            
+            # Cache the response
+            self._set_gemini_cache(cache_key, ai_response)
+            
+            duration = time.time() - start_time
+            logger.info(f"Generated Gemini response in {duration:.2f}s")
+            self.stats.gemini_calls += 1
+            self.stats.total_gemini_time += duration
+            
+            return ai_response
+            
+        except Exception as e:
+            duration = time.time() - start_time
+            logger.error(f"Gemini API error after {duration:.2f}s: {e}")
+            self.stats.gemini_errors += 1
+            
+            # Fallback response
+            if analysis.get('data'):
+                return "I found some relevant server information, but I'm having trouble generating a detailed response right now. Please try a more specific query."
+            else:
+                return "I'm having trouble accessing the Gemini service right now. Please try again later or rephrase your question."
+    
+    def _build_context_from_analysis(self, analysis: dict) -> str:
+        """Build context string from analysis data."""
+        context = ""
+        
+        if analysis['type'] == 'summary' and isinstance(analysis['data'], dict):
+            data = analysis['data']
+            context = f"Total servers: {data.get('total_servers', 'N/A')}, "
+            context += f"Active: {data.get('active_servers', 'N/A')}, "
+            context += f"Up: {data.get('servers_up', 'N/A')}, "
+            context += f"Down: {data.get('servers_down', 'N/A')}"
+            
+        elif analysis.get('data') and isinstance(analysis['data'], list):
+            servers = analysis['data'][:3]  # Limit context size
+            context = f"Found {len(analysis['data'])} servers. Sample: "
+            for server in servers:
+                if isinstance(server, dict):
+                    context += f"{server.get('hostname', 'Unknown')} ({server.get('status', 'Unknown')}), "
+                    
+        return context.strip(', ')
+    
+    def _manage_cache_size(self):
+        """Manage cache size to prevent memory issues."""
+        if len(self.cache) > self.max_cache_size:
+            # Remove oldest entries (simple FIFO)
+            oldest_keys = list(self.cache.keys())[:len(self.cache) - self.max_cache_size + 10]
+            for key in oldest_keys:
+                del self.cache[key]
+            logger.debug(f"Cache cleaned, removed {len(oldest_keys)} entries")
+    
+    def _get_from_gemini_cache(self, cache_key: str) -> Optional[str]:
+        """Get cached response with TTL check."""
+        if cache_key not in self._gemini_cache:
+            return None
+        
+        cached_response, timestamp = self._gemini_cache[cache_key]
+        age = time.time() - timestamp
+        
+        if age > self.cache_config.ttl:
+            del self._gemini_cache[cache_key]
+            if cache_key in self._cache_timestamps:
+                del self._cache_timestamps[cache_key]
+            logger.debug(f"Cache entry expired: {cache_key} (age: {age:.1f}s)")
+            return None
+        
+        return cached_response
+    
+    def _set_gemini_cache(self, cache_key: str, response: str) -> None:
+        """Set cache with automatic cleanup."""
+        self._gemini_cache[cache_key] = (response, time.time())
+        self._cache_timestamps[cache_key] = time.time()
+        self._manage_gemini_cache_size()
+    
+    def _manage_gemini_cache_size(self) -> None:
+        """Manage cache size and cleanup old entries with detailed logging."""
+        if len(self._gemini_cache) <= self.cache_config.max_size:
+            return
+        
+        logger.debug(f"Gemini cache cleanup: {len(self._gemini_cache)} entries, max: {self.cache_config.max_size}")
+        
+        # Remove oldest entries first
+        sorted_entries = sorted(
+            self._gemini_cache.items(), 
+            key=lambda x: x[1][1]  # Sort by timestamp
+        )
+        
+        entries_to_remove = len(self._gemini_cache) - self.cache_config.max_size + 10  # Remove extra for efficiency
+        for key, _ in sorted_entries[:entries_to_remove]:
+            del self._gemini_cache[key]
+            if key in self._cache_timestamps:
+                del self._cache_timestamps[key]
+        
+        logger.info(f"Gemini cache cleanup completed: removed {entries_to_remove} entries")
+    
+    def get_performance_stats(self) -> dict:
+        """Get performance statistics."""
+        stats = self.performance_stats.copy()
+        if stats['api_calls'] > 0:
+            stats['avg_api_time'] = stats['total_api_time'] / stats['api_calls']
+        if stats['openai_calls'] > 0:
+            stats['avg_openai_time'] = stats['total_openai_time'] / stats['openai_calls']
+        stats['cache_size'] = len(self.cache)
+        return stats
+    
+    def clear_cache(self):
+        """Clear response cache."""
+        cache_size = len(self.cache)
+        self.cache.clear()
+        logger.info(f"Cleared cache with {cache_size} entries")
+    
+    def _fallback_response(self, analysis: dict) -> str:
+        """Generate fallback response when OpenAI is not available."""
+        data = analysis.get('data', {})
+        
+        if analysis['type'] == 'summary' and isinstance(data, dict):
+            response = "**Server Summary for Chennai Data Center:**\n\n"
+            response += f"Total servers: {data.get('total_servers', 'N/A')}\n"
+            response += f"Active servers: {data.get('active_servers', 'N/A')}\n"
+            response += f"Servers up: {data.get('servers_up', 'N/A')}\n"
+            response += f"Servers down: {data.get('servers_down', 'N/A')}\n"
+            response += f"Servers in maintenance: {data.get('servers_maintenance', 'N/A')}\n"
+            return response
+        elif analysis['type'] in ['status_query', 'search', 'environment_query'] and isinstance(data, list):
+            if data:
+                response = f"Found {len(data)} servers:\n\n"
+                for server in data[:3]:  # Show first 3
+                    if isinstance(server, dict):
+                        response += self.format_server_info(server) + "\n"
+                if len(data) > 3:
+                    response += f"\n... and {len(data) - 3} more servers."
+                return response
+            else:
+                return "No servers found matching your criteria."
+        elif analysis['type'] == 'specific_server' and isinstance(data, dict):
+            return self.format_server_info(data)
+        
+        return "I have the server data but need more context to provide a helpful answer. Could you be more specific about what you'd like to know?"
+    
+    # Utility and management methods
+    def get_performance_stats(self) -> Dict[str, Any]:
+        """Get comprehensive performance statistics."""
+        return {
+            "api_calls": self.stats.api_calls,
+            "total_api_time": round(self.stats.total_api_time, 2),
+            "avg_api_time": round(self.stats.avg_api_time, 2),
+            "openai_calls": self.stats.openai_calls,
+            "total_openai_time": round(self.stats.total_openai_time, 2),
+            "avg_openai_time": round(self.stats.avg_openai_time, 2),
+            "openai_errors": self.stats.openai_errors,
+            "cache_hits": self.stats.cache_hits,
+            "cache_misses": self.stats.cache_misses,
+            "cache_hit_ratio": round(self.stats.cache_hit_ratio, 1),
+            "api_cache_size": len(self._api_cache),
+            "openai_cache_size": len(self._openai_cache)
+        }
+    
+    def get_cache_stats(self) -> Dict[str, Any]:
+        """Get detailed cache statistics."""
+        api_valid = sum(1 for key in self._api_cache.keys() if self._is_cache_valid(key))
+        openai_valid = sum(1 for key in self._openai_cache.keys() if self._is_cache_valid(key))
+        
+        return {
+            "api_cache": {
+                "total_entries": len(self._api_cache),
+                "valid_entries": api_valid,
+                "expired_entries": len(self._api_cache) - api_valid,
+                "max_size": self.cache_config.max_api_cache_size
+            },
+            "openai_cache": {
+                "total_entries": len(self._openai_cache),
+                "valid_entries": openai_valid,
+                "expired_entries": len(self._openai_cache) - openai_valid,
+                "max_size": self.cache_config.max_openai_cache_size
+            },
+            "ttl_seconds": self.cache_config.ttl_seconds
+        }
+    
+    def clear_cache(self, cache_type: str = "all") -> None:
+        """
+        Clear cached data.
+        
+        Args:
+            cache_type: Type of cache to clear ("api", "openai", or "all")
+        """
+        if cache_type in ("api", "all"):
+            api_size = len(self._api_cache)
+            self._api_cache.clear()
+            logger.info(f"API cache cleared: {api_size} entries removed")
+        
+        if cache_type in ("openai", "all"):
+            openai_size = len(self._openai_cache)
+            self._openai_cache.clear()
+            logger.info(f"OpenAI cache cleared: {openai_size} entries removed")
+        
+        if cache_type == "all":
+            self._cache_timestamps.clear()
+    
+    def health_check(self) -> Dict[str, Any]:
+        """Perform a comprehensive health check."""
+        health_status = {
+            "api_connectivity": False,
+            "openai_availability": self.is_openai_available,
+            "cache_status": "healthy",
+            "performance": self.get_performance_stats(),
+            "timestamp": time.time()
+        }
+        
+        try:
+            # Test API connectivity
+            summary = self.get_server_summary()
+            health_status["api_connectivity"] = "error" not in summary
+        except Exception as e:
+            logger.error(f"API health check failed: {e}")
+            health_status["api_connectivity"] = False
+        
+        # Check cache health
+        total_cache_size = len(self._api_cache) + len(self._openai_cache)
+        max_total_size = (
+            self.cache_config.max_api_cache_size + 
+            self.cache_config.max_openai_cache_size
+        )
+        
+        if total_cache_size > max_total_size * 0.9:
+            health_status["cache_status"] = "warning"
+        
+        return health_status
+    
+    def __repr__(self) -> str:
+        """String representation of the chatbot."""
+        return (
+            f"ServerChatbot(api_url='{self.api_base_url}', "
+            f"openai_available={self.is_openai_available}, "
+            f"api_calls={self.stats.api_calls})"
+        )
+    
 # Example usage
 if __name__ == "__main__":
     chatbot = ServerChatbot()
