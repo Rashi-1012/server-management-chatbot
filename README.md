@@ -161,7 +161,7 @@ The chatbot uses OpenAI's GPT models for natural language processing. To enable 
 1. Get an OpenAI API key from https://platform.openai.com/
 2. Set the `OPENAI_API_KEY` environment variable
 3. Restart the application
-
+4. you can use other models as well.
 Without the API key, the chatbot will use rule-based responses.
 
 ## 🔒 Security Considerations
