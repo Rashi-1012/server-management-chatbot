@@ -6,6 +6,7 @@ import plotly.graph_objects as go
 from datetime import datetime
 import json
 from chatbot import ServerChatbot
+from datetime import datetime
 
 # Page configuration
 st.set_page_config(
@@ -68,6 +69,22 @@ def fetch_api_data(endpoint, params=None):
     except requests.exceptions.RequestException as e:
         st.error(f"Failed to fetch data: {str(e)}")
         return None
+
+def format_datetime_iso(s):
+    """Format an ISO 8601 string to 'YYYY-MM-DD HH:MM:SS'. Returns 'N/A' on failure."""
+    if not s:
+        return "N/A"
+    try:
+        # Handle common variants (strip trailing Z)
+        if isinstance(s, str):
+            s_clean = s.rstrip('Z')
+            return datetime.fromisoformat(s_clean).strftime("%Y-%m-%d %H:%M:%S")
+        # If already a datetime
+        if isinstance(s, datetime):
+            return s.strftime("%Y-%m-%d %H:%M:%S")
+    except Exception:
+        pass
+    return str(s)
 
 def main():
     # Header
@@ -205,7 +222,7 @@ def show_server_list():
             'CPU Cores': server.get('cpu_cores', 'N/A'),
             'Memory (GB)': server.get('memory_gb', 'N/A'),
             'Owner': server.get('owner_name', 'N/A'),
-            'Last Seen': server.get('last_seen', 'N/A')
+            'Last Seen': format_datetime_iso(server.get('last_seen'))
         })
     
     df = pd.DataFrame(server_data)
@@ -250,6 +267,7 @@ def show_server_list():
                 **Memory:** {server_detail.get('memory_gb', 'N/A')} GB
                 **Disk:** {server_detail.get('disk_gb', 'N/A')} GB
                 **Owner:** {server_detail.get('owner_name', 'N/A')}
+                **Last Seen:** {format_datetime_iso(server_detail.get('last_seen'))}
                 """)
             
             if server_detail.get('notes'):

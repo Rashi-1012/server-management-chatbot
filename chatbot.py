@@ -11,6 +11,7 @@ from urllib.parse import urljoin
 import google.generativeai as genai
 import requests
 from dotenv import load_dotenv
+from datetime import datetime
 
 # Load environment variables
 load_dotenv()
@@ -526,7 +527,21 @@ Guidelines:
         if server.get('owner_name'):
             info += f" Owner: {server['owner_name']}\n"
         if server.get('last_seen'):
-            info += f" Last seen: {server['last_seen']}\n"
+            last_seen = server.get('last_seen')
+            try:
+                if isinstance(last_seen, str):
+                    last_seen = last_seen.rstrip('Z')
+                    dt = datetime.fromisoformat(last_seen)
+                elif isinstance(last_seen, datetime):
+                    dt = last_seen
+                else:
+                    dt = None
+                if dt:
+                    info += f" Last seen: {dt.strftime('%Y-%m-%d %H:%M:%S')}\n"
+                else:
+                    info += f" Last seen: {server['last_seen']}\n"
+            except Exception:
+                info += f" Last seen: {server['last_seen']}\n"
         
         return info
     
