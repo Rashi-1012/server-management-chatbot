@@ -38,11 +38,11 @@ def seed_sample_data():
     
     # Create sample users
     users_data = [
-        {"name": "Rajesh Kumar", "email": "rajesh@company.com", "role": "admin", "department": "DevOps"},
-        {"name": "Priya Sharma", "email": "priya@company.com", "role": "user", "department": "Development"},
-        {"name": "Arjun Patel", "email": "arjun@company.com", "role": "user", "department": "QA"},
-        {"name": "Meera Singh", "email": "meera@company.com", "role": "user", "department": "Development"},
-        {"name": "Karthik Reddy", "email": "karthik@company.com", "role": "admin", "department": "Infrastructure"},
+        {"name": "Raja", "email": "raja@company.com", "role": "admin", "department": "DevOps"},
+        {"name": "Rasheed", "email": "rasheed@company.com", "role": "user", "department": "Development"},
+        {"name": "Arjun", "email": "arjun@company.com", "role": "user", "department": "QA"},
+        {"name": "Meera", "email": "meera@company.com", "role": "user", "department": "Development"},
+        {"name": "Karthik", "email": "karthik@company.com", "role": "admin", "department": "Infrastructure"},
     ]
     
     users = []

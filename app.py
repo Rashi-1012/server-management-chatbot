@@ -166,9 +166,9 @@ def show_dashboard():
     activity_data = [
         {"Time": "2 minutes ago", "Event": "Server chennai-web-01 status checked", "User": "Admin"},
         {"Time": "5 minutes ago", "Event": "Server chennai-db-01 backup completed", "User": "System"},
-        {"Time": "12 minutes ago", "Event": "New query: 'Show production servers'", "User": "Priya Sharma"},
+        {"Time": "12 minutes ago", "Event": "New query: 'Show production servers'", "User": "Rasheed"},
         {"Time": "18 minutes ago", "Event": "Server chennai-api-01 health check passed", "User": "System"},
-        {"Time": "25 minutes ago", "Event": "Server summary requested", "User": "Rajesh Kumar"}
+        {"Time": "25 minutes ago", "Event": "Server summary requested", "User": "Raja"}
     ]
     
     activity_df = pd.DataFrame(activity_data)
